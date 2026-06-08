@@ -1,5 +1,7 @@
 # ESP32-C6 Zigbee Coordinator
 
+🇬🇧 English | [🇮🇹 Italiano](README_IT.md)
+
 Generic Zigbee IAS Zone coordinator for the ESP32-C6 with a UART JSON bridge to any host MCU.
 
 Flash the `coordinator/` firmware on an ESP32-C6 board, connect it via UART to your host MCU (ESP32-S3, ESP32, Arduino, Raspberry Pi, …), add the two files from `host_bridge/` to your host project, and you have a ready-to-use Zigbee sensor bridge with less than 10 lines of integration code.
