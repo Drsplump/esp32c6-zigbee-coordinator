@@ -8,9 +8,9 @@
         {
             "name": "PlatformIO",
             "includePath": [
-                "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator/coordinator/include",
-                "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator/coordinator/src",
+                "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator",
                 "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator/.pio/libdeps/coordinator/ArduinoJson/src",
+                "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator/coordinator/include",
                 "/Users/Seiv/.platformio/packages/framework-arduinoespressif32-libs/esp32c6/include/newlib/platform_include",
                 "/Users/Seiv/.platformio/packages/framework-arduinoespressif32-libs/esp32c6/include/freertos/config/include",
                 "/Users/Seiv/.platformio/packages/framework-arduinoespressif32-libs/esp32c6/include/freertos/config/include/freertos",
@@ -328,9 +328,9 @@
             "browse": {
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
-                    "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator/coordinator/include",
-                    "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator/coordinator/src",
+                    "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator",
                     "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator/.pio/libdeps/coordinator/ArduinoJson/src",
+                    "/Users/Seiv/Documents/PlatformIO/Projects/esp32c6-zigbee-coordinator/coordinator/include",
                     "/Users/Seiv/.platformio/packages/framework-arduinoespressif32-libs/esp32c6/include/newlib/platform_include",
                     "/Users/Seiv/.platformio/packages/framework-arduinoespressif32-libs/esp32c6/include/freertos/config/include",
                     "/Users/Seiv/.platformio/packages/framework-arduinoespressif32-libs/esp32c6/include/freertos/config/include/freertos",
