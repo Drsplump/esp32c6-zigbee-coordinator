@@ -112,15 +112,15 @@ static void processFrame(const char* json) {
 
     // --- Sensor data frames ---
     UartC6SensorFrame sf;
-    sf.id          = doc["id"]   | UART_C6_DEFAULT_SENSOR_ID;
-    sf.name        = doc["name"] | UART_C6_DEFAULT_SENSOR_NAME;
-    sf.alarm       = parseBool(doc["alarm"],   false);
-    sf.control     = parseBool(doc["control"], false);
+    sf.id          = doc["id"]        | UART_C6_DEFAULT_SENSOR_ID;
+    sf.name        = doc["zone_type"] | (doc["name"] | UART_C6_DEFAULT_SENSOR_NAME);
+    sf.alarm       = parseBool(doc["alarm1"],  false);
+    sf.tamper      = parseBool(doc["tamper"],  false);
+    sf.control     = sf.alarm || parseBool(doc["alarm2"], false) || sf.tamper;
     sf.joined      = parseBool(doc["joined"],  true);
     sf.sleep       = parseBool(doc["sleep"],   false);
     sf.battery     = doc["battery"]     | -1;
     sf.linkquality = doc["linkquality"] | -1;
-    sf.tamper      = parseBool(doc["tamper"], false);
     sf.seq         = doc["seq"] | 0;
 
     if (sSensorCb) sSensorCb(sf);

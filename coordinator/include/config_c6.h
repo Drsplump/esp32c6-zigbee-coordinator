@@ -7,12 +7,12 @@
 
 // --- UART to host MCU (e.g. ESP32-S3) ---
 // Physical wiring:
-//   C6 GPIO2  (RX) ← Host UART TX
-//   C6 GPIO21 (TX) → Host UART RX
+//   C6 D2/GPIO2  (RX) ← Host UART TX
+//   C6 D3/GPIO21 (TX) → Host UART RX
 //   Common GND required. Both sides are 3.3V — no level shifter needed.
 #define S3_UART_NUM       1        // UART1 on C6
-#define S3_UART_RX_PIN    2        // C6 GPIO2
-#define S3_UART_TX_PIN    21       // C6 GPIO21
+#define S3_UART_RX_PIN    2        // C6 D2/GPIO2
+#define S3_UART_TX_PIN    21       // C6 D3/GPIO21
 #define S3_UART_BAUD      115200
 #define S3_UART_BUF       256
 

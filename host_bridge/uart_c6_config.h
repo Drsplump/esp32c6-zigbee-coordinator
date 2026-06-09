@@ -8,8 +8,8 @@
 #define UART_C6_INDEX       1
 
 // Physical pins on the host MCU.
-//   Host UART TX → C6 GPIO2  (RX)
-//   Host UART RX ← C6 GPIO21 (TX)
+//   Host UART TX (GPIO18) → C6 D2/GPIO2  (RX)
+//   Host UART RX (GPIO17) ← C6 D3/GPIO21 (TX)
 #define UART_C6_TX_PIN      18
 #define UART_C6_RX_PIN      17
 

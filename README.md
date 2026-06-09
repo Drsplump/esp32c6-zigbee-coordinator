@@ -4,19 +4,19 @@
 
 Generic Zigbee IAS Zone coordinator for the ESP32-C6 with a UART JSON bridge to any host MCU.
 
-Flash the `coordinator/` firmware on an ESP32-C6 board, connect it via UART to your host MCU (ESP32-S3, ESP32, Arduino, Raspberry Pi, …), add the two files from `host_bridge/` to your host project, and you have a ready-to-use Zigbee sensor bridge with less than 10 lines of integration code.
+Flash the `coordinator` firmware on an ESP32-C6, connect the two boards via UART, flash the `host_bridge` firmware on an ESP32-S3 (or any Arduino-compatible MCU), and you have a ready-to-use Zigbee sensor bridge with less than 10 lines of integration code.
 
 ---
 
 ## What it does
 
 ```
-IAS Zone Sensor ─[Zigbee]─► ESP32-C6 ─[UART JSON]─► Host MCU
+IAS Zone Sensor ─[Zigbee]─► ESP32-C6 ─[UART JSON]─► ESP32-S3 / Host MCU
                              coordinator              your application
 ```
 
-- **Coordinator** (ESP32-C6): acts as a Zigbee coordinator, enrolls IAS Zone sensors, and forwards all sensor events and battery reports to the host as newline-delimited JSON frames over UART.
-- **Host bridge** (any Arduino-compatible MCU): receives frames, parses them, and calls your application callbacks — no Zigbee stack knowledge required on the host side.
+- **Coordinator** (ESP32-C6): acts as a Zigbee coordinator, auto-detects the IAS Zone type, and sends newline-delimited JSON frames to the host on every state change and every 10 seconds.
+- **Host bridge** (ESP32-S3 or any Arduino-compatible MCU): receives frames, parses them, and calls your application callbacks — no Zigbee stack knowledge required.
 
 Compatible with any Zigbee IAS Zone sensor (flood, motion, door/window contact, …).
 Tested with the Sonoff SNZB-05P flood sensor.
@@ -27,18 +27,19 @@ Tested with the Sonoff SNZB-05P flood sensor.
 
 ```
 esp32c6-zigbee-coordinator/
-├── coordinator/              ESP32-C6 firmware (standalone PlatformIO project)
-│   ├── platformio.ini
-│   ├── link_zigbee.py        required build script for pioarduino 53.x
-│   ├── src/
-│   │   └── main.cpp
-│   └── include/
-│       ├── config_c6.h       ← edit this: pins, sensor ID, timing
-│       └── debug.h           serial debug macros
-├── host_bridge/              Two files to add to your host project
-│   ├── uart_c6_config.h      ← edit this: host UART pins and parameters
+├── platformio.ini            ← single PlatformIO file with both envs
+├── coordinator/
+│   ├── src/main.cpp          ESP32-C6 coordinator firmware
+│   ├── include/
+│   │   ├── config_c6.h       ← edit here: UART pins, Zigbee channel, timing
+│   │   └── debug.h
+│   └── link_zigbee.py        required build script for pioarduino 53.x
+├── host_bridge/
+│   ├── platformio.ini        standalone PlatformIO project for ESP32-S3
+│   ├── src/main.cpp          integration example (put your app logic here)
+│   ├── uart_c6_config.h      ← edit here: host UART pins and parameters
 │   ├── uart_c6_bridge.h      public API
-│   └── uart_c6_bridge.cpp    implementation (no external dependencies)
+│   └── uart_c6_bridge.cpp    bridge implementation (no external dependencies)
 └── docs/
     └── wiring.md             wiring diagram, JSON protocol, pairing procedure
 ```
@@ -47,115 +48,102 @@ esp32c6-zigbee-coordinator/
 
 ## Hardware requirements
 
-| Component          | Notes                                                  |
-|--------------------|--------------------------------------------------------|
-| ESP32-C6 board     | ESP32-C6-DevKitC-1 or Seeed XIAO ESP32-C6             |
-| Host MCU           | Any Arduino-compatible board with a free hardware UART |
-| Zigbee IAS sensor  | Sonoff SNZB-05P or any IAS Zone-compatible device      |
-| 100 µF capacitor   | Recommended on C6 3V3/GND to absorb Zigbee TX spikes  |
+| Component           | Notes                                                            |
+|---------------------|------------------------------------------------------------------|
+| ESP32-C6-DevKitC-1  | Zigbee coordinator                                               |
+| ESP32-S3-DevKitC-1  | Host MCU (or any Arduino board with a free hardware UART)        |
+| Zigbee IAS sensor   | Sonoff SNZB-05P or any IAS Zone-compatible device                |
+| 100 µF capacitor    | Recommended on C6 3V3/GND to absorb Zigbee TX current spikes    |
+
+---
+
+## Wiring
+
+| ESP32-S3 (host)    | Direction | ESP32-C6 (coordinator)   |
+|--------------------|-----------|--------------------------|
+| GPIO18 — UART1 TX  | →         | D2 / GPIO2 — UART1 RX    |
+| GPIO17 — UART1 RX  | ←         | D3 / GPIO21 — UART1 TX   |
+| GND                | ↔         | GND                      |
+
+> Both boards operate at 3.3V — no level shifter required.  
+> Pins can be changed in `coordinator/include/config_c6.h` (C6 side) and `host_bridge/uart_c6_config.h` (host side).
 
 ---
 
 ## Quick start
 
-### 1. Flash the coordinator
+### 1. Open the project
 
-Edit [`coordinator/include/config_c6.h`](coordinator/include/config_c6.h) if you need to change:
-- UART pins (`S3_UART_RX_PIN` / `S3_UART_TX_PIN`)
-- Sensor identity (`SENSOR_ID` / `SENSOR_NAME`)
-- Zigbee channel (`ZIGBEE_CHANNEL`)
-- IAS zone type (`IAS_ZONE_TYPE`)
+Open `esp32c6-zigbee-coordinator.code-workspace` in VSCode. The PlatformIO status bar shows two environments: **coordinator** and **host_bridge**.
 
-Then flash:
+### 2. Flash the coordinator (ESP32-C6)
+
+Select the `coordinator` env and click Upload, or from the project root:
+
 ```bash
-cd coordinator
 pio run -e coordinator --target upload
 ```
 
-### 2. Integrate the host bridge
+Edit [`coordinator/include/config_c6.h`](coordinator/include/config_c6.h) to change pins or Zigbee settings.
 
-Copy `host_bridge/uart_c6_config.h`, `uart_c6_bridge.h`, and `uart_c6_bridge.cpp` into your host project.
+### 3. Flash the host bridge (ESP32-S3)
 
-Edit `uart_c6_config.h` to set the correct UART pins for your host board:
-```c
-#define UART_C6_TX_PIN  18   // host TX → C6 RX
-#define UART_C6_RX_PIN  17   // host RX ← C6 TX
+Select the `host_bridge` env and click Upload, or:
+
+```bash
+pio run -e host_bridge --target upload
 ```
 
-Add the bridge to your sketch:
+Edit [`host_bridge/uart_c6_config.h`](host_bridge/uart_c6_config.h) for your board's UART pins.  
+Put your application logic in [`host_bridge/src/main.cpp`](host_bridge/src/main.cpp):
+
 ```cpp
 #include "uart_c6_bridge.h"
 
 void onSensor(const UartC6SensorFrame& f) {
-    Serial.printf("[Sensor] id=%s alarm=%d battery=%d%% lq=%d joined=%d\n",
-                  f.id, f.alarm, f.battery, f.linkquality, f.joined);
-
-    if (f.alarm) {
-        // your alarm handling here
-    }
+    Serial.printf("[Sensor] id=%s type=%s alarm=%d battery=%d%% lqi=%d\n",
+                  f.id, f.name, f.alarm, f.battery, f.linkquality);
+    if (f.alarm) { /* handle alarm */ }
 }
 
 void onEvent(const UartC6EventFrame& f) {
     if (f.event == UartC6Event::NetworkOpen)
         Serial.printf("[Zigbee] Network open for %lus\n", (unsigned long)f.param);
-    else if (f.event == UartC6Event::DeviceJoined)
-        Serial.printf("[Zigbee] Device joined: %s\n", f.extra);
 }
 
-void setup() {
-    Serial.begin(115200);
-    uartC6BridgeInit(onSensor, onEvent);
-}
-
-void loop() {
-    uartC6BridgePoll();   // non-blocking, call every loop tick
-}
+void setup() { Serial.begin(115200); uartC6BridgeInit(onSensor, onEvent); }
+void loop()  { uartC6BridgePoll(); }
 ```
 
-### 3. Pair a sensor
+### 4. Pair a sensor
 
-Press the **BOOT button** on the ESP32-C6 to open the Zigbee pairing window for 60 seconds, then put your sensor into pairing mode. See [docs/wiring.md](docs/wiring.md) for the full procedure.
+1. Press **BOOT** on the ESP32-C6 → pairing window opens for 60 seconds
+2. Put sensor into pairing mode (usually hold its button ~5 s)
+3. Sensor joins and is enrolled automatically
+4. JSON frames start arriving on the host within seconds
+
+For a **full re-pair** (erase Zigbee NVRAM): hold BOOT while powering up the C6.
 
 ---
 
 ## Host bridge API
 
 ```cpp
-// Initialize UART and register callbacks (call once from setup)
 void uartC6BridgeInit(UartC6SensorCallback onSensor, UartC6EventCallback onEvent);
-
-// Non-blocking poll — call every loop tick
 void uartC6BridgePoll();
-
-// Send open/close network commands to the C6
 void uartC6OpenNetwork(uint8_t durationSec = 60);
 void uartC6CloseNetwork();
-
-// Diagnostics
-UartC6Stats      uartC6BridgeGetStats();
-uint32_t         uartC6BridgeLastFrameAgeMs();
+UartC6Stats  uartC6BridgeGetStats();
+uint32_t     uartC6BridgeLastFrameAgeMs();
 ```
 
-See [`host_bridge/uart_c6_bridge.h`](host_bridge/uart_c6_bridge.h) for the full struct definitions.
+See [`host_bridge/uart_c6_bridge.h`](host_bridge/uart_c6_bridge.h) for full struct definitions.
 
 ---
 
 ## JSON protocol
 
-See [docs/wiring.md](docs/wiring.md) for the complete frame format reference and wiring diagram.
-
----
-
-## Supported sensors
-
-Any Zigbee IAS Zone sensor should work.  
-Change `IAS_ZONE_TYPE` in `config_c6.h` to match your sensor:
-
-| Zone type | Value  | Example                  |
-|-----------|--------|--------------------------|
-| Water     | 0x002D | Sonoff SNZB-05P          |
-| Motion    | 0x0028 | Aqara, IKEA, Sonoff PIR  |
-| Contact   | 0x0015 | Door/window contact      |
+See [docs/wiring.md](docs/wiring.md) for the complete frame format reference.
 
 ---
 
