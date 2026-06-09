@@ -1,22 +1,36 @@
 /**
- * ESP32-C6 Zigbee Coordinator — Bridge generica IAS Zone
+ * ESP32-C6 Zigbee Coordinator — Universal IAS Zone Bridge
  *
  * Flusso dati:
  *   Sensore IAS Zone →[Zigbee]→ ESP32-C6 →[UART JSON]→ MCU Host
  *
+ * Zone types rilevati automaticamente (standard ZCL IAS Zone):
+ *   motion, contact, fire, water, gas, personal_emergency, vibration,
+ *   remote_control, key_fob, keypad, warning_device, standard_cie
+ *
  * Protocollo UART (115200 8N1, delimitato da newline):
- *   TX → host: {"id":"...","name":"...","alarm":0/1,"control":0/1,
- *               "joined":1,"sleep":0,"battery":85,"linkquality":155,"seq":N}
- *   RX ← host: {"ack":1,"seq":N,"status":"ok","queued":1}
- *            or {"cmd":"open_network","duration":60}
- *            or {"cmd":"close_network"}
+ *   TX → host (evento zona):
+ *     {"id":"0xABCD","zone_type":"water","zone_type_id":42,
+ *      "alarm1":0,"alarm2":0,"tamper":0,"battery_low":0,
+ *      "supervision_fail":0,"restore_fail":0,"trouble":0,"ac_fault":0,"test":0,
+ *      "joined":1,"sleep":0,"battery":85,"linkquality":155,"seq":N}
+ *
+ *   TX → host (eventi di sistema):
+ *     {"event":"device_joined","short_addr":"0xABCD","seq":N}
+ *     {"event":"device_left","seq":N}
+ *     {"event":"network_open","param":60,"seq":N}
+ *     {"event":"network_closed","seq":N}
+ *     {"event":"c6_reset","reason":"POWERON","code":1,"seq":N}
+ *     {"event":"c6_heartbeat","seq":N}
+ *
+ *   RX ← host:
+ *     {"ack":1,"seq":N,"status":"ok"}
+ *     {"cmd":"open_network","duration":60}
+ *     {"cmd":"close_network"}
  *
  * Pulsante BOOT (GPIO9):
  *   - Pressione breve a runtime : apre la rete Zigbee per OPEN_NETWORK_SECS
  *   - Tenuto al power-on       : cancella la NVRAM Zigbee (re-pair completo)
- *
- * Modificare coordinator/include/config_c6.h per cambiare pin, identità sensore
- * e parametri di temporizzazione senza toccare questo file.
  */
 
 #include <Arduino.h>
@@ -27,7 +41,6 @@
 #include <nvs_flash.h>
 #include <esp_system.h>
 
-// API Zigbee ESP-IDF (arduino-esp32 3.x con ZIGBEE_MODE_COORDINATOR)
 #include "esp_zigbee_core.h"
 #include "nwk/esp_zigbee_nwk.h"
 #include "ha/esp_zigbee_ha_standard.h"
@@ -40,39 +53,102 @@
 #include "debug.h"
 
 // ============================================================
-// Tipi
+// Registro dispositivi
+// ============================================================
+
+struct DeviceInfo {
+    uint16_t short_addr;
+    uint8_t  endpoint;
+    uint16_t zone_type_id;    // 0xFFFF = non ancora noto
+    uint16_t zone_status;     // bitmask IAS ZoneStatus corrente
+    int      battery;         // -1 = sconosciuto
+    uint8_t  lqi;
+    bool     joined;
+    bool     ever_seen;       // almeno una notifica zona ricevuta
+    uint32_t last_activity_ms;
+    bool     used;
+};
+
+static DeviceInfo g_devices[MAX_DEVICES];
+
+static DeviceInfo* findDevice(uint16_t short_addr) {
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (g_devices[i].used && g_devices[i].short_addr == short_addr)
+            return &g_devices[i];
+    }
+    return nullptr;
+}
+
+static DeviceInfo* findOrCreateDevice(uint16_t short_addr, uint8_t endpoint = 1) {
+    DeviceInfo* d = findDevice(short_addr);
+    if (d) return d;
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (!g_devices[i].used) {
+            g_devices[i]              = {};
+            g_devices[i].short_addr   = short_addr;
+            g_devices[i].endpoint     = endpoint;
+            g_devices[i].zone_type_id = 0xFFFF;
+            g_devices[i].battery      = -1;
+            g_devices[i].used         = true;
+            return &g_devices[i];
+        }
+    }
+    DBG_PRINTF("[C6] Tabella dispositivi piena! 0x%04X ignorato\n", short_addr);
+    return nullptr;
+}
+
+// ============================================================
+// Mapping zone type → stringa
+// ============================================================
+
+static const char* zoneTypeName(uint16_t id) {
+    switch (id) {
+        case 0x0000: return "standard_cie";
+        case 0x000D: return "motion";
+        case 0x0015: return "contact";
+        case 0x0028: return "fire";
+        case 0x002A: return "water";
+        case 0x002B: return "gas";
+        case 0x002C: return "personal_emergency";
+        case 0x002D: return "vibration";
+        case 0x010F: return "remote_control";
+        case 0x0115: return "key_fob";
+        case 0x021D: return "keypad";
+        case 0x0225: return "warning_device";
+        default:     return "unknown";
+    }
+}
+
+// ============================================================
+// Tipi eventi inter-task
 // ============================================================
 
 struct ZbEvent {
-    enum Type : uint8_t { ZONE_CHANGE, BATTERY_UPDATE, DEVICE_JOINED } type;
-    bool     alarm;
-    bool     tamper;
-    int      battery;     // -1 = invariato
+    enum Type : uint8_t {
+        ZONE_CHANGE, BATTERY_UPDATE, DEVICE_JOINED, ZONE_TYPE_READ, DEVICE_LEFT
+    } type;
+    uint16_t short_addr;
+    uint8_t  endpoint;
+    uint16_t zone_status;    // ZONE_CHANGE
+    uint16_t zone_type_id;   // ZONE_TYPE_READ
+    int      battery;        // BATTERY_UPDATE, -1 = non valido
     uint8_t  lqi;
-    uint16_t short_addr;  // solo DEVICE_JOINED
 };
 
 // ============================================================
 // Stato globale (aggiornato SOLO da loop())
 // ============================================================
 
-static bool     g_alarm    = false;
-static bool     g_tamper   = false;
-static int      g_battery  = -1;
-static uint8_t  g_lqi      = 0;
-
-static uint32_t g_seq      = 0;
-static uint32_t g_lastHB   = 0;
+static uint32_t g_seq       = 0;
+static uint32_t g_lastHB    = 0;
 
 static bool     g_networkOpen        = false;
 static uint32_t g_networkOpenUntilMs = 0;
 static bool     g_forceNvramErase    = false;
 
 static uint32_t g_bootMs              = 0;
-static bool     g_sensorEverSeen      = false;
-static bool     g_sensorJoined        = false;
+static bool     g_anySensorEverSeen   = false;
 static uint32_t g_lastReopenMs        = 0;
-static uint32_t g_lastSensorActivityMs = 0;
 
 static uint16_t g_enrollPendingAddr = 0;
 static uint8_t  g_enrollPendingEp   = 0;
@@ -80,28 +156,41 @@ static uint8_t  g_enrollPendingEp   = 0;
 static QueueHandle_t  g_evtQueue = nullptr;
 static HardwareSerial HostSerial(S3_UART_NUM);
 
-static char g_ackBuf[96];
+static char g_ackBuf[128];
 static int  g_ackPos = 0;
 
 // ============================================================
 // Frame JSON → host
 // ============================================================
 
-static void sendJsonFrame(bool alarm, bool tamper, int battery, uint8_t lqi,
-                          int control, bool joined, bool sleep) {
+static void sendJsonFrame(const DeviceInfo& dev, bool sleep) {
     JsonDocument doc;
-    doc["id"]      = SENSOR_ID;
-    doc["name"]    = SENSOR_NAME;
-    doc["alarm"]   = alarm   ? 1 : 0;
-    doc["control"] = control;
-    doc["joined"]  = joined ? 1 : 0;
-    doc["sleep"]   = sleep  ? 1 : 0;
-    doc["seq"]     = (uint32_t)(++g_seq);
-    if (battery >= 0) doc["battery"]     = battery;
-    if (lqi > 0)      doc["linkquality"] = (int)lqi;
-    if (tamper)       doc["tamper"]      = true;
+    char id_buf[8];
+    snprintf(id_buf, sizeof(id_buf), "0x%04X", dev.short_addr);
 
-    char buf[200];
+    doc["id"]        = id_buf;
+    doc["zone_type"] = zoneTypeName(dev.zone_type_id);
+    if (dev.zone_type_id != 0xFFFF)
+        doc["zone_type_id"] = (int)dev.zone_type_id;
+
+    uint16_t s = dev.zone_status;
+    doc["alarm1"]          = (s & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_ALARM1)      ? 1 : 0;
+    doc["alarm2"]          = (s & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_ALARM2)      ? 1 : 0;
+    doc["tamper"]          = (s & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_TAMPER)      ? 1 : 0;
+    doc["battery_low"]     = (s & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_BATTERY)     ? 1 : 0;
+    doc["supervision_fail"]= (s & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_SUPERVISION) ? 1 : 0;
+    doc["restore_fail"]    = (s & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_RESTORE)     ? 1 : 0;
+    doc["trouble"]         = (s & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_TROUBLE)     ? 1 : 0;
+    doc["ac_fault"]        = (s & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_AC_MAINS)    ? 1 : 0;
+    doc["test"]            = (s & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_TEST)        ? 1 : 0;
+
+    doc["joined"] = dev.joined ? 1 : 0;
+    doc["sleep"]  = sleep ? 1 : 0;
+    doc["seq"]    = (uint32_t)(++g_seq);
+    if (dev.battery >= 0) doc["battery"]     = dev.battery;
+    if (dev.lqi > 0)      doc["linkquality"] = (int)dev.lqi;
+
+    char buf[380];
     size_t n = serializeJson(doc, buf, sizeof(buf) - 1);
     buf[n++] = '\n';
     HostSerial.write(reinterpret_cast<const uint8_t*>(buf), n);
@@ -207,37 +296,47 @@ static void pollHostAck() {
         } else if (g_ackPos < (int)sizeof(g_ackBuf) - 2) {
             g_ackBuf[g_ackPos++] = c;
         } else {
-            g_ackPos = 0;  // overflow: scarta
+            g_ackPos = 0;
         }
     }
 }
 
 // ============================================================
-// Callback Zigbee (chiamate dal task Zigbee → push in coda)
+// Callback Zigbee → push in coda
 // ============================================================
 
-static void pushZoneChange(uint16_t zoneStatus) {
+static void pushZoneChange(uint16_t short_addr, uint8_t endpoint, uint16_t zone_status) {
     if (!g_evtQueue) return;
-    ZbEvent evt;
-    evt.type   = ZbEvent::ZONE_CHANGE;
-    evt.alarm  = (zoneStatus & (ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_ALARM1 |
-                                ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_ALARM2)) != 0;
-    evt.tamper = (zoneStatus & 0x0004) != 0;
-    evt.battery = -1;
-    evt.lqi     = 0;
+    ZbEvent evt = {};
+    evt.type        = ZbEvent::ZONE_CHANGE;
+    evt.short_addr  = short_addr;
+    evt.endpoint    = endpoint;
+    evt.zone_status = zone_status;
+    evt.battery     = -1;
     if (xQueueSend(g_evtQueue, &evt, 0) != pdPASS) {
-        DBG_PRINTF("[ZB] queue piena, ZoneChange perso (0x%04X)\n", zoneStatus);
+        DBG_PRINTF("[ZB] queue piena, ZoneChange perso (0x%04X status=0x%04X)\n",
+                   short_addr, zone_status);
     }
 }
 
-static void pushBatteryPctValue(int pct) {
+static void pushZoneTypeRead(uint16_t short_addr, uint8_t endpoint, uint16_t zone_type_id) {
     if (!g_evtQueue) return;
-    ZbEvent evt;
-    evt.type    = ZbEvent::BATTERY_UPDATE;
-    evt.alarm   = false;
-    evt.tamper  = false;
-    evt.battery = pct;
-    evt.lqi     = 0;
+    ZbEvent evt = {};
+    evt.type         = ZbEvent::ZONE_TYPE_READ;
+    evt.short_addr   = short_addr;
+    evt.endpoint     = endpoint;
+    evt.zone_type_id = zone_type_id;
+    evt.battery      = -1;
+    xQueueSend(g_evtQueue, &evt, 0);
+}
+
+static void pushBatteryUpdate(uint16_t short_addr, uint8_t endpoint, int pct) {
+    if (!g_evtQueue) return;
+    ZbEvent evt = {};
+    evt.type       = ZbEvent::BATTERY_UPDATE;
+    evt.short_addr = short_addr;
+    evt.endpoint   = endpoint;
+    evt.battery    = pct;
     xQueueSend(g_evtQueue, &evt, 0);
 }
 
@@ -249,6 +348,10 @@ static int calcBatteryPctFromVoltage(uint8_t rawVoltage) {
     if (pct > 100.0f) pct = 100.0f;
     return static_cast<int>(pct + 0.5f);
 }
+
+// ============================================================
+// Comandi ZCL verso i dispositivi
+// ============================================================
 
 static void sendIasCieAddressWrite(uint16_t shortAddr, uint8_t dstEndpoint) {
     static esp_zb_ieee_addr_t cieAddr;
@@ -273,6 +376,23 @@ static void sendIasCieAddressWrite(uint16_t shortAddr, uint8_t dstEndpoint) {
     cmd.attr_number     = 1;
     cmd.attr_field      = &attr;
     esp_zb_zcl_write_attr_cmd_req(&cmd);
+}
+
+static void readZoneTypeAttr(uint16_t shortAddr, uint8_t dstEndpoint) {
+    static uint16_t attr_id = ESP_ZB_ZCL_ATTR_IAS_ZONE_ZONETYPE_ID;
+    esp_zb_zcl_read_attr_cmd_t cmd = {};
+    cmd.zcl_basic_cmd.dst_addr_u.addr_short = shortAddr;
+    cmd.zcl_basic_cmd.dst_endpoint = dstEndpoint;
+    cmd.zcl_basic_cmd.src_endpoint = EP_CIE;
+    cmd.address_mode     = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+    cmd.clusterID        = ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE;
+    cmd.direction        = 0;  // to server
+    cmd.dis_defalut_resp = 0;
+    cmd.manuf_specific   = 0;
+    cmd.manuf_code       = 0;
+    cmd.attr_number      = 1;
+    cmd.attr_field       = &attr_id;
+    esp_zb_zcl_read_attr_cmd_req(&cmd);
 }
 
 static void sendIasZoneReportConfig(uint16_t shortAddr, uint8_t dstEndpoint) {
@@ -333,8 +453,9 @@ static void sendPowerConfigReportConfig(uint16_t shortAddr, uint8_t dstEndpoint)
     esp_zb_zcl_config_report_cmd_req(&cmd);
 }
 
-// Fallback di enrollment forzato: molti sensori IAS (es. SNZB-05P) non inviano
-// una EnrollRequest dopo la scrittura dell'indirizzo CIE — forza dopo 2 s.
+// Fallback enrollment: molti sensori IAS non inviano EnrollRequest dopo la
+// scrittura CIE — forza dopo 2 s. Se arriva una EnrollRequest naturale,
+// g_enrollPendingAddr viene azzerat e questo callback è un no-op.
 static void forceEnrollResponse(uint8_t /*param*/) {
     if (g_enrollPendingAddr == 0) return;
     esp_zb_zcl_ias_zone_enroll_response_cmd_t resp = {};
@@ -349,24 +470,34 @@ static void forceEnrollResponse(uint8_t /*param*/) {
     esp_zb_zcl_ias_zone_enroll_cmd_resp(&resp);
     sendIasZoneReportConfig(g_enrollPendingAddr, g_enrollPendingEp);
     sendPowerConfigReportConfig(g_enrollPendingAddr, g_enrollPendingEp);
+    // zone type letto già in DEVICE_ANNCE; se non ancora risposto, ritenta
+    readZoneTypeAttr(g_enrollPendingAddr, g_enrollPendingEp);
     g_enrollPendingAddr = 0;
 }
 
-// Gestore azioni ZCL (chiamato dal task Zigbee — NON usare Serial qui)
+// ============================================================
+// Gestore azioni ZCL (task Zigbee — NON usare Serial/HostSerial qui)
+// ============================================================
+
 static esp_err_t zbActionHandler(esp_zb_core_action_callback_id_t cb_id, const void* msg) {
     switch (cb_id) {
 
+        // --- Notifica cambio stato zona ---
         case ESP_ZB_CORE_CMD_IAS_ZONE_ZONE_STATUS_CHANGE_NOT_ID: {
             const auto* n =
                 static_cast<const esp_zb_zcl_ias_zone_status_change_notification_message_t*>(msg);
-            pushZoneChange(n->zone_status);
+            pushZoneChange(n->info.src_address.u.short_addr,
+                           n->info.src_endpoint,
+                           n->zone_status);
             break;
         }
 
+        // --- Richiesta enrollment naturale (include il zone_type) ---
         case ESP_ZB_CORE_CMD_IAS_ZONE_ZONE_ENROLL_REQUEST_ID: {
             const auto* req =
                 static_cast<const esp_zb_zcl_ias_zone_enroll_request_message_t*>(msg);
-            g_enrollPendingAddr = 0;  // EnrollRequest naturale — annulla il fallback forzato
+            g_enrollPendingAddr = 0;  // annulla il fallback forzato
+
             esp_zb_zcl_ias_zone_enroll_response_cmd_t resp = {};
             resp.zcl_basic_cmd.dst_addr_u.addr_short = req->info.src_address.u.short_addr;
             resp.zcl_basic_cmd.dst_endpoint = req->info.src_endpoint;
@@ -375,32 +506,63 @@ static esp_err_t zbActionHandler(esp_zb_core_action_callback_id_t cb_id, const v
             resp.enroll_rsp_code = ESP_ZB_ZCL_IAS_ZONE_ENROLL_RESPONSE_CODE_SUCCESS;
             resp.zone_id = 0;
             esp_zb_zcl_ias_zone_enroll_cmd_resp(&resp);
-            sendIasZoneReportConfig(resp.zcl_basic_cmd.dst_addr_u.addr_short,
-                                    resp.zcl_basic_cmd.dst_endpoint);
-            sendPowerConfigReportConfig(resp.zcl_basic_cmd.dst_addr_u.addr_short,
-                                        resp.zcl_basic_cmd.dst_endpoint);
+            sendIasZoneReportConfig(req->info.src_address.u.short_addr,
+                                    req->info.src_endpoint);
+            sendPowerConfigReportConfig(req->info.src_address.u.short_addr,
+                                        req->info.src_endpoint);
+            // zone_type disponibile direttamente nella richiesta
+            pushZoneTypeRead(req->info.src_address.u.short_addr,
+                             req->info.src_endpoint,
+                             req->zone_type);
             break;
         }
 
+        // --- Risposta a read attribute (zone type letto con readZoneTypeAttr) ---
+        case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID: {
+            const auto* resp =
+                static_cast<const esp_zb_zcl_cmd_read_attr_resp_message_t*>(msg);
+            if (resp->info.cluster != ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE) break;
+            for (const auto* v = resp->variables; v != nullptr; v = v->next) {
+                if (v->status == ESP_ZB_ZCL_STATUS_SUCCESS &&
+                    v->attribute.id == ESP_ZB_ZCL_ATTR_IAS_ZONE_ZONETYPE_ID &&
+                    v->attribute.data.value != nullptr) {
+                    uint16_t zt = *static_cast<const uint16_t*>(v->attribute.data.value);
+                    pushZoneTypeRead(resp->info.src_address.u.short_addr,
+                                     resp->info.src_endpoint, zt);
+                }
+            }
+            break;
+        }
+
+        // --- Report attributi (batteria, zone_status) ---
         case ESP_ZB_CORE_REPORT_ATTR_CB_ID: {
             const auto* r =
                 static_cast<const esp_zb_zcl_report_attr_message_t*>(msg);
+
             if (r->cluster == ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE &&
                 r->attribute.id == ESP_ZB_ZCL_ATTR_IAS_ZONE_ZONESTATUS_ID &&
                 r->attribute.data.value) {
-                uint16_t zone_status = *static_cast<const uint16_t*>(r->attribute.data.value);
-                pushZoneChange(zone_status);
+                uint16_t zs = *static_cast<const uint16_t*>(r->attribute.data.value);
+                pushZoneChange(r->src_address.u.short_addr,
+                               r->src_endpoint, zs);
                 break;
             }
-            if (r->cluster == ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG && r->attribute.data.value) {
-                if (r->attribute.id == ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID) {
+            if (r->cluster == ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG &&
+                r->attribute.data.value) {
+                if (r->attribute.id ==
+                    ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID) {
                     uint8_t rawPct = *static_cast<const uint8_t*>(r->attribute.data.value);
                     if (rawPct != 0xFF && rawPct <= 200)
-                        pushBatteryPctValue(static_cast<int>(rawPct / 2));
-                } else if (r->attribute.id == ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID) {
-                    uint8_t rawVolt = *static_cast<const uint8_t*>(r->attribute.data.value);
-                    int pct = calcBatteryPctFromVoltage(rawVolt);
-                    if (pct >= 0) pushBatteryPctValue(pct);
+                        pushBatteryUpdate(r->src_address.u.short_addr,
+                                         r->src_endpoint,
+                                         static_cast<int>(rawPct / 2));
+                } else if (r->attribute.id ==
+                           ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID) {
+                    uint8_t rawV = *static_cast<const uint8_t*>(r->attribute.data.value);
+                    int pct = calcBatteryPctFromVoltage(rawV);
+                    if (pct >= 0)
+                        pushBatteryUpdate(r->src_address.u.short_addr,
+                                         r->src_endpoint, pct);
                 }
             }
             break;
@@ -413,7 +575,7 @@ static esp_err_t zbActionHandler(esp_zb_core_action_callback_id_t cb_id, const v
 }
 
 // ============================================================
-// Gestore segnali (richiesto dallo stack Zigbee)
+// Gestore segnali Zigbee
 // ============================================================
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t* sig_struct) {
@@ -442,15 +604,15 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* sig_struct) {
 
         case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
             if (err == ESP_OK) {
-                g_sensorJoined       = true;
-                g_sensorEverSeen     = false;
-                g_lastSensorActivityMs = 0;
                 DBG_PRINTF("[ZB] Reboot: rete esistente, apertura steering (%ds)\n",
                            BOOT_NETWORK_SECS);
-                g_networkOpen        = true;
-                g_networkOpenUntilMs = millis() + (uint32_t)BOOT_NETWORK_SECS * 1000UL;
+                if (g_evtQueue) {
+                    ZbEvent evt = {};
+                    evt.type = ZbEvent::DEVICE_JOINED;
+                    evt.short_addr = 0xFFFF;  // sentinella: segnala reboot con rete esistente
+                    xQueueSend(g_evtQueue, &evt, 0);
+                }
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
-                sendEventFrame("network_open", BOOT_NETWORK_SECS);
             } else {
                 esp_zb_scheduler_alarm(
                     reinterpret_cast<esp_zb_callback_t>(
@@ -464,10 +626,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* sig_struct) {
                 DBG_PRINTF("[ZB] Rete formata — PAN 0x%04X, ch %d (steering %ds)\n",
                               esp_zb_get_pan_id(), esp_zb_get_current_channel(),
                               BOOT_NETWORK_SECS);
-                g_networkOpen        = true;
-                g_networkOpenUntilMs = millis() + (uint32_t)BOOT_NETWORK_SECS * 1000UL;
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
-                sendEventFrame("network_open", BOOT_NETWORK_SECS);
             } else {
                 DBG_PRINTLN("[ZB] Errore di formazione — nuovo tentativo");
                 esp_zb_scheduler_alarm(
@@ -485,8 +644,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* sig_struct) {
         case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE: {
             auto* p = static_cast<esp_zb_zdo_signal_device_annce_params_t*>(
                           esp_zb_app_signal_get_params(p_sig));
-            DBG_PRINTF("[ZB] Dispositivo unito: 0x%04X\n", p->device_short_addr);
+            DBG_PRINTF("[ZB] Dispositivo annunciato: 0x%04X\n", p->device_short_addr);
             sendIasCieAddressWrite(p->device_short_addr, 1);
+            // Leggi subito il zone type (risposta via ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID)
+            readZoneTypeAttr(p->device_short_addr, 1);
             g_enrollPendingAddr = p->device_short_addr;
             g_enrollPendingEp   = 1;
             esp_zb_scheduler_alarm(forceEnrollResponse, 0, 2000);
@@ -494,20 +655,19 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* sig_struct) {
                 ZbEvent evt = {};
                 evt.type       = ZbEvent::DEVICE_JOINED;
                 evt.short_addr = p->device_short_addr;
-                if (xQueueSend(g_evtQueue, &evt, 0) != pdPASS) {
-                    DBG_PRINTF("[ZB] DEVICE_JOINED queue piena! 0x%04X\n", p->device_short_addr);
-                }
+                evt.endpoint   = 1;
+                xQueueSend(g_evtQueue, &evt, 0);
             }
             break;
         }
 
         case ESP_ZB_ZDO_SIGNAL_LEAVE:
-            DBG_PRINTLN("[ZB] Dispositivo uscito dalla rete");
-            g_sensorJoined        = false;
-            g_sensorEverSeen      = false;
-            g_lastSensorActivityMs = 0;
-            g_alarm  = false;
-            g_tamper = false;
+            DBG_PRINTLN("[ZB] Un dispositivo ha lasciato la rete");
+            if (g_evtQueue) {
+                ZbEvent evt = {};
+                evt.type = ZbEvent::DEVICE_LEFT;
+                xQueueSend(g_evtQueue, &evt, 0);
+            }
             break;
 
         default:
@@ -530,24 +690,25 @@ static void zigbeeTask(void* /*pv*/) {
         .esp_zb_role         = ESP_ZB_DEVICE_TYPE_COORDINATOR,
         .install_code_policy = false,
     };
-    zb_cfg.nwk_cfg.zczr_cfg.max_children = 10;
+    zb_cfg.nwk_cfg.zczr_cfg.max_children = MAX_DEVICES;
 
     esp_zb_nvram_erase_at_start(g_forceNvramErase);
     esp_zb_init(&zb_cfg);
 
-    // Costruisci endpoint: cluster Basic + cluster IAS Zone (ruolo CIE)
+    // Endpoint CIE: cluster Basic + cluster IAS Zone (ruolo CIE)
+    // IAS_ZONE_TYPE sul coordinatore = 0x0000 (Standard CIE): accetta qualsiasi sensore
     esp_zb_cluster_list_t* cl = esp_zb_zcl_cluster_list_create();
 
     esp_zb_basic_cluster_cfg_t basic_cfg = {
         .zcl_version  = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
-        .power_source = 0x03,  // CC (corrente continua)
+        .power_source = 0x03,
     };
     esp_zb_cluster_list_add_basic_cluster(
         cl, esp_zb_basic_cluster_create(&basic_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_ias_zone_cluster_cfg_t ias_cfg = {
         .zone_state  = ESP_ZB_ZCL_IAS_ZONE_ZONESTATE_NOT_ENROLLED,
-        .zone_type   = IAS_ZONE_TYPE,
+        .zone_type   = ESP_ZB_ZCL_IAS_ZONE_ZONETYPE_STANDARD_CIE,  // 0x0000: accetta tutti i tipi
         .zone_status = 0,
     };
     esp_zb_cluster_list_add_ias_zone_cluster(
@@ -567,8 +728,26 @@ static void zigbeeTask(void* /*pv*/) {
     esp_zb_set_primary_network_channel_set(1UL << ZIGBEE_CHANNEL);
 
     ESP_ERROR_CHECK(esp_zb_start(false));
-    esp_zb_stack_main_loop();  // non ritorna mai
+    esp_zb_stack_main_loop();
     vTaskDelete(nullptr);
+}
+
+// ============================================================
+// Helpers loop()
+// ============================================================
+
+static bool anyDeviceJoined() {
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (g_devices[i].used && g_devices[i].joined) return true;
+    }
+    return false;
+}
+
+static bool anyDeviceEverSeen() {
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (g_devices[i].used && g_devices[i].ever_seen) return true;
+    }
+    return false;
 }
 
 // ============================================================
@@ -578,13 +757,12 @@ static void zigbeeTask(void* /*pv*/) {
 void setup() {
     Serial.begin(115200);
     delay(300);
-    DBG_PRINTLN("[C6] === Boot ESP32-C6 Zigbee Coordinator ===");
+    DBG_PRINTLN("[C6] === Boot ESP32-C6 Zigbee Coordinator (Universal IAS) ===");
 
     esp_reset_reason_t resetReason = esp_reset_reason();
     DBG_PRINTF("[C6] Causa di reset: %s (%d)\n",
                resetReasonToString(resetReason), static_cast<int>(resetReason));
 
-    // Rileva pulsante BOOT tenuto al power-on → cancella NVRAM Zigbee
     pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
     delay(20);
     bool bootPressed = true;
@@ -595,18 +773,15 @@ void setup() {
     g_forceNvramErase = bootPressed;
     if (g_forceNvramErase) DBG_PRINTLN("[C6] BOOT tenuto: cancellazione NVRAM Zigbee abilitata");
 
-    // UART verso MCU host
     HostSerial.end();
     HostSerial.setRxBufferSize(S3_UART_BUF);
     delay(20);
     HostSerial.begin(S3_UART_BAUD, SERIAL_8N1, S3_UART_RX_PIN, S3_UART_TX_PIN);
     delay(20);
 
-    // Attendi che l'MCU host inizializzi il suo bridge UART prima di inviare frame
     delay(8000);
     sendResetEventFrame(resetReason);
 
-    // NVS deve essere pronto prima dell'init dello stack Zigbee
     esp_err_t nvsErr = nvs_flash_init();
     if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -614,10 +789,9 @@ void setup() {
     }
     ESP_ERROR_CHECK(nvsErr);
 
-    g_evtQueue = xQueueCreate(8, sizeof(ZbEvent));
+    g_evtQueue = xQueueCreate(16, sizeof(ZbEvent));
     configASSERT(g_evtQueue);
 
-    // Task Zigbee su core 0 (core radio)
     xTaskCreatePinnedToCore(zigbeeTask, "zb_task", 8192, nullptr, 5, nullptr, 0);
 
     g_bootMs = millis();
@@ -628,95 +802,137 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
-    // Elabora eventi dal zigbeeTask
+    // --- Elabora eventi dal zigbeeTask ---
     ZbEvent evt;
     while (xQueueReceive(g_evtQueue, &evt, 0) == pdTRUE) {
+
         if (evt.type == ZbEvent::ZONE_CHANGE) {
-            g_alarm  = evt.alarm;
-            g_tamper = evt.tamper;
-            g_sensorEverSeen      = true;
-            g_sensorJoined        = true;
-            g_lastSensorActivityMs = now;
-            sendJsonFrame(g_alarm, g_tamper, g_battery, g_lqi, g_alarm ? 1 : 0, true, false);
-            g_lastHB = now;
-            DBG_PRINTF("[C6] ZoneChange: alarm=%d tamper=%d\n", g_alarm, g_tamper);
-        } else if (evt.type == ZbEvent::BATTERY_UPDATE && evt.battery >= 0) {
-            g_battery = evt.battery;
-            g_sensorJoined        = true;
-            g_lastSensorActivityMs = now;
-            DBG_PRINTF("[C6] Batteria: %d%%\n", g_battery);
-            sendJsonFrame(g_alarm, g_tamper, g_battery, g_lqi, g_alarm ? 1 : 0, true, false);
-            g_lastHB = now;
-        } else if (evt.type == ZbEvent::DEVICE_JOINED) {
-            g_sensorJoined        = true;
-            g_lastSensorActivityMs = now;
-            DBG_PRINTF("[C6] Dispositivo unito (loop): 0x%04X\n", evt.short_addr);
-            char buf[80];
-            snprintf(buf, sizeof(buf),
-                     "{\"event\":\"device_joined\",\"short_addr\":\"0x%04X\",\"seq\":%lu}\n",
-                     evt.short_addr, (unsigned long)++g_seq);
-            HostSerial.write(reinterpret_cast<const uint8_t*>(buf), strlen(buf));
-            if (g_networkOpen) {
-                g_networkOpenUntilMs = now + 30000;  // chiudi tra 30 s dopo il join
+            DeviceInfo* d = findOrCreateDevice(evt.short_addr, evt.endpoint);
+            if (d) {
+                d->zone_status      = evt.zone_status;
+                d->joined           = true;
+                d->ever_seen        = true;
+                d->last_activity_ms = now;
+                g_anySensorEverSeen = true;
+                bool alm1 = (evt.zone_status & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_ALARM1) != 0;
+                bool alm2 = (evt.zone_status & (uint16_t)ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_ALARM2) != 0;
+                DBG_PRINTF("[C6] 0x%04X ZoneChange: status=0x%04X alarm1=%d alarm2=%d type=%s\n",
+                           evt.short_addr, evt.zone_status, alm1, alm2,
+                           zoneTypeName(d->zone_type_id));
+                sendJsonFrame(*d, false);
+                g_lastHB = now;
             }
+
+        } else if (evt.type == ZbEvent::BATTERY_UPDATE && evt.battery >= 0) {
+            DeviceInfo* d = findOrCreateDevice(evt.short_addr, evt.endpoint);
+            if (d) {
+                d->battery          = evt.battery;
+                d->joined           = true;
+                d->last_activity_ms = now;
+                DBG_PRINTF("[C6] 0x%04X Batteria: %d%%\n", evt.short_addr, evt.battery);
+                sendJsonFrame(*d, false);
+                g_lastHB = now;
+            }
+
+        } else if (evt.type == ZbEvent::ZONE_TYPE_READ) {
+            DeviceInfo* d = findOrCreateDevice(evt.short_addr, evt.endpoint);
+            if (d) {
+                d->zone_type_id = evt.zone_type_id;
+                DBG_PRINTF("[C6] 0x%04X ZoneType: 0x%04X (%s)\n",
+                           evt.short_addr, evt.zone_type_id,
+                           zoneTypeName(evt.zone_type_id));
+            }
+
+        } else if (evt.type == ZbEvent::DEVICE_JOINED) {
+            if (evt.short_addr == 0xFFFF) {
+                // Reboot con rete esistente: assume tutti i device precedenti ancora connessi
+                g_networkOpen        = true;
+                g_networkOpenUntilMs = now + (uint32_t)BOOT_NETWORK_SECS * 1000UL;
+                sendEventFrame("network_open", BOOT_NETWORK_SECS);
+            } else {
+                DeviceInfo* d = findOrCreateDevice(evt.short_addr, evt.endpoint);
+                if (d) {
+                    d->joined           = true;
+                    d->last_activity_ms = now;
+                }
+                char buf[88];
+                snprintf(buf, sizeof(buf),
+                         "{\"event\":\"device_joined\",\"short_addr\":\"0x%04X\",\"seq\":%lu}\n",
+                         evt.short_addr, (unsigned long)++g_seq);
+                HostSerial.write(reinterpret_cast<const uint8_t*>(buf), strlen(buf));
+                DBG_PRINTF("[C6] Dispositivo unito: 0x%04X\n", evt.short_addr);
+                if (g_networkOpen) {
+                    g_networkOpenUntilMs = now + 30000;
+                }
+            }
+
+        } else if (evt.type == ZbEvent::DEVICE_LEFT) {
+            // Senza indirizzo specifico, segna tutti come non connessi
+            for (int i = 0; i < MAX_DEVICES; i++) {
+                if (g_devices[i].used) {
+                    g_devices[i].joined    = false;
+                    g_devices[i].ever_seen = false;
+                    g_devices[i].zone_status = 0;
+                }
+            }
+            sendEventFrame("device_left");
+            DBG_PRINTLN("[C6] Rete: dispositivo uscito");
         }
     }
 
-    // Timeout rete aperta
+    // --- Timeout rete aperta ---
     if (g_networkOpen && now >= g_networkOpenUntilMs) {
         g_networkOpen = false;
         sendEventFrame("network_closed");
         DBG_PRINTLN("[C6] Finestra di pairing chiusa (timeout)");
     }
 
-    // Heartbeat periodico
+    // --- Heartbeat periodico ---
     if (now - g_lastHB >= HEARTBEAT_MS) {
         g_lastHB = now;
         sendBridgeHeartbeatEvent();
-        if (g_sensorJoined || g_sensorEverSeen) {
-            bool sleeping = g_sensorJoined && !g_sensorEverSeen && !g_alarm && !g_tamper;
-            sendJsonFrame(g_alarm, g_tamper, g_battery, g_lqi, 0, g_sensorJoined, sleeping);
+        for (int i = 0; i < MAX_DEVICES; i++) {
+            if (!g_devices[i].used) continue;
+            const DeviceInfo& d = g_devices[i];
+            if (!d.joined && !d.ever_seen) continue;
+            bool sleeping = d.joined && !d.ever_seen && d.zone_status == 0;
+            sendJsonFrame(d, sleeping);
         }
     }
 
-    // Elabora ACK / comandi dall'host
+    // --- ACK / comandi dall'host ---
     pollHostAck();
 
-    // Timeout attività sensore: segna come inattivo senza perdere lo stato di pairing
+    // --- Timeout attività per-device: passa in ONLINE_SLEEP senza perdere il pairing ---
     static const uint32_t SENSOR_ACTIVITY_TIMEOUT_MS = 90000UL;
-    static bool sensorInactiveLogged = false;
-    if (g_sensorEverSeen && g_lastSensorActivityMs > 0 &&
-        (now - g_lastSensorActivityMs) >= SENSOR_ACTIVITY_TIMEOUT_MS) {
-        g_sensorEverSeen = false;
-        g_alarm  = false;
-        g_tamper = false;
-        if (!sensorInactiveLogged) {
-            DBG_PRINTF("[C6] Sensore inattivo da %lus — stato: ONLINE_SLEEP (pairing mantenuto)\n",
-                       (now - g_lastSensorActivityMs) / 1000UL);
-            sensorInactiveLogged = true;
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        DeviceInfo& d = g_devices[i];
+        if (!d.used || !d.ever_seen) continue;
+        if (d.last_activity_ms > 0 &&
+            (now - d.last_activity_ms) >= SENSOR_ACTIVITY_TIMEOUT_MS) {
+            d.ever_seen   = false;
+            d.zone_status = 0;
+            DBG_PRINTF("[C6] 0x%04X inattivo da %lus — ONLINE_SLEEP\n",
+                       d.short_addr,
+                       (unsigned long)(now - d.last_activity_ms) / 1000UL);
         }
     }
-    if (g_lastSensorActivityMs > 0 &&
-        (now - g_lastSensorActivityMs) < SENSOR_ACTIVITY_TIMEOUT_MS) {
-        sensorInactiveLogged = false;
-    }
 
-    // Riapri automaticamente lo steering per end-device orfani in deep backoff
-    // (gli end device ritentano il re-join ogni 15–30 min dopo disconnessione prolungata)
-    if (!g_sensorJoined && !g_sensorEverSeen && !g_networkOpen &&
+    // --- Riapertura automatica per end-device in backoff ---
+    if (!anyDeviceJoined() && !anyDeviceEverSeen() && !g_networkOpen &&
         (now - g_lastReopenMs) >= REJOIN_REOPEN_PAUSE_MS) {
         g_lastReopenMs       = now;
         g_networkOpen        = true;
         g_networkOpenUntilMs = now + (uint32_t)BOOT_NETWORK_SECS * 1000UL;
-        DBG_PRINTLN("[C6] Sensore non connesso — riapertura rete (attesa indefinita)");
+        DBG_PRINTLN("[C6] Nessun dispositivo connesso — riapertura rete");
         requestNetworkSteering();
     }
 
-    // Pulsante BOOT: apre finestra di pairing
+    // --- Pulsante BOOT: apre finestra di pairing ---
     static uint32_t lastBtnMs = 0;
     if (now - lastBtnMs > 300 && digitalRead(BOOT_BUTTON_PIN) == LOW) {
         lastBtnMs = now;
-        DBG_PRINTF("[C6] Pulsante boot: apertura finestra di pairing (%ds)\n", OPEN_NETWORK_SECS);
+        DBG_PRINTF("[C6] Pulsante boot: apertura finestra (%ds)\n", OPEN_NETWORK_SECS);
         g_networkOpen        = true;
         g_networkOpenUntilMs = now + (uint32_t)OPEN_NETWORK_SECS * 1000UL;
         requestNetworkSteering();
