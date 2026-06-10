@@ -18,8 +18,8 @@ IAS Zone Sensor ─[Zigbee]─► ESP32-C6 ─[UART JSON]─► ESP32-S3 / Host 
 - **Coordinator** (ESP32-C6): acts as a Zigbee coordinator, auto-detects the IAS Zone type, and sends newline-delimited JSON frames to the host on every state change and every 10 seconds.
 - **Host bridge** (ESP32-S3 or any Arduino-compatible MCU): receives frames, parses them, and calls your application callbacks — no Zigbee stack knowledge required.
 
-Compatible with any Zigbee IAS Zone sensor (flood, motion, door/window contact, …).
-Tested with the Sonoff SNZB-05P flood sensor.
+Compatible with any Zigbee IAS Zone sensor (flood, motion, door/window contact, smoke, …).
+Tested with the Sonoff SNZB-05P flood sensor (zone type `0x002A`).
 
 ---
 

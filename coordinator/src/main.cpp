@@ -107,9 +107,9 @@ static const char* zoneTypeName(uint16_t id) {
         case 0x000D: return "motion";
         case 0x0015: return "contact";
         case 0x0028: return "fire";
-        case 0x0029: return "water";
-        case 0x002A: return "water";       // Sonoff SNZB-05P e ecosistema HA usano 0x002A per flood
-        case 0x002B: return "personal_emergency";
+        case 0x0029: return "water";  // ZCL standard water sensor
+        case 0x002A: return "water";  // Sonoff SNZB-05P e molti vendor HA usano 0x002A per flood
+        case 0x002B: return "co";     // Carbon monoxide (usato da vari vendor)
         case 0x002C: return "vibration";
         case 0x002D: return "remote_control";
         case 0x010F: return "key_fob";

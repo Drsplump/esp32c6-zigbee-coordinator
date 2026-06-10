@@ -18,8 +18,8 @@ Sensore IAS Zone ─[Zigbee]─► ESP32-C6 ─[UART JSON]─► ESP32-S3 / MCU 
 - **Coordinatore** (ESP32-C6): agisce come coordinatore Zigbee, rileva automaticamente il tipo di zona IAS, ed invia frame JSON delimitati da newline all'host su UART ad ogni cambio di stato e ogni 10 secondi.
 - **Bridge host** (ESP32-S3 o MCU Arduino-compatibile): riceve i frame, li analizza e chiama i callback della tua applicazione — nessuna conoscenza dello stack Zigbee richiesta.
 
-Compatibile con qualsiasi sensore Zigbee IAS Zone (allagamento, movimento, contatto porta/finestra, …).
-Testato con il sensore di allagamento Sonoff SNZB-05P.
+Compatibile con qualsiasi sensore Zigbee IAS Zone (allagamento, movimento, contatto porta/finestra, fumo, …).
+Testato con il sensore di allagamento Sonoff SNZB-05P (zone type `0x002A`).
 
 ---
 
@@ -176,18 +176,29 @@ uint32_t     uartC6BridgeLastFrameAgeMs();
 
 ### Struttura UartC6SensorFrame
 
-| Campo        | Tipo     | Descrizione                                              |
-|--------------|----------|----------------------------------------------------------|
-| `id`         | `char*`  | Indirizzo corto Zigbee (es. `"0xACA5"`)                  |
-| `name`       | `char*`  | Tipo zona rilevato automaticamente (es. `"water"`)       |
-| `alarm`      | `bool`   | `true` = alarm1 attivo                                   |
-| `control`    | `bool`   | `true` se alarm1 \|\| alarm2 \|\| tamper                 |
-| `tamper`     | `bool`   | `true` = tamper attivo                                   |
-| `joined`     | `bool`   | `true` = sensore associato                               |
-| `sleep`      | `bool`   | `true` = sensore in sleep (nessuna attività recente)     |
-| `battery`    | `int`    | Percentuale batteria, `-1` se non ancora ricevuto        |
-| `linkquality`| `int`    | LQI Zigbee (0–255), `-1` se non disponibile             |
-| `seq`        | `uint32` | Numero sequenza frame                                    |
+| Campo        | Tipo     | Descrizione                                                   |
+|--------------|----------|---------------------------------------------------------------|
+| `id`         | `char*`  | Indirizzo corto Zigbee (es. `"0xACA5"`)                       |
+| `name`       | `char*`  | Tipo zona (`"water"`, `"motion"`, `"fire"`, `"contact"`, …)  |
+| `alarm`      | `bool`   | `true` = alarm1 attivo                                        |
+| `control`    | `bool`   | `true` se alarm1 \|\| alarm2 \|\| tamper                      |
+| `tamper`     | `bool`   | `true` = tamper attivo                                        |
+| `joined`     | `bool`   | `true` = sensore associato alla rete                          |
+| `sleep`      | `bool`   | `true` = sensore in sleep (nessuna attività recente)          |
+| `battery`    | `int`    | Percentuale batteria, `-1` se non ancora ricevuto             |
+| `linkquality`| `int`    | LQI Zigbee 0–255, `-1` se non disponibile                    |
+| `seq`        | `uint32` | Numero sequenza frame                                         |
+
+### Tipi zona supportati
+
+| `name`       | zone_type_id  | Note                                          |
+|--------------|---------------|-----------------------------------------------|
+| `water`      | 0x0029 / 0x002A | 0x002A usato da Sonoff SNZB-05P e molti vendor |
+| `motion`     | 0x000D        | PIR standard ZCL                              |
+| `contact`    | 0x0015        | Contatto porta/finestra                       |
+| `fire`       | 0x0028        | Fumo/calore                                   |
+| `co`         | 0x002B        | Monossido di carbonio                         |
+| `vibration`  | 0x002C        | Vibrazione/movimento                          |
 
 ---
 

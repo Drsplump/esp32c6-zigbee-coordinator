@@ -115,11 +115,12 @@
 
 Il coordinatore rileva il tipo automaticamente al momento del pairing. Nessuna configurazione manuale necessaria.
 
-| Tipo zona    | zone_type_id  | Esempio sensore              |
-|--------------|---------------|------------------------------|
-| `water`      | 0x002A (42)   | Sonoff SNZB-05P (flood)      |
-| `fire`       | 0x0028 (40)   | Rilevatore fumo/calore        |
-| `motion`     | 0x000D (13)   | Aqara, IKEA, Sonoff PIR      |
-| `contact`    | 0x0015 (21)   | Contatto porta/finestra      |
-| `vibration`  | 0x002C (44)   | Sensore vibrazione           |
-| `co`         | 0x002A (42)   | Sensore monossido di carbonio|
+| Tipo zona   | zone_type_id        | Esempio sensore                            |
+|-------------|---------------------|--------------------------------------------|
+| `water`     | 0x002A (42)         | Sonoff SNZB-05P — molti vendor usano 0x002A |
+| `water`     | 0x0029 (41)         | Vendor che seguono spec ZCL stretta         |
+| `motion`    | 0x000D (13)         | PIR standard (Aqara, IKEA, Sonoff)         |
+| `fire`      | 0x0028 (40)         | Rilevatore fumo/calore                     |
+| `contact`   | 0x0015 (21)         | Contatto porta/finestra                    |
+| `co`        | 0x002B (43)         | Sensore monossido di carbonio              |
+| `vibration` | 0x002C (44)         | Sensore vibrazione                         |
